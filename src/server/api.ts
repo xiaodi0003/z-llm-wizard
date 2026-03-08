@@ -162,11 +162,9 @@ export class APIServer {
   }
 
   private handleStreamingResponse(req: Request, res: Response, requestId: string, clientId: string, request: ChatCompletionRequest) {
-    // Handle client disconnect FIRST
-    req.on('close', () => {
-      console.log(`Client disconnected for request ${requestId}`);
-      this.queue.removeRequest(requestId);
-    });
+    let isCompleted = false;
+
+    console.log(`[API] Starting streaming response for ${requestId}`);
 
     // Setup SSE response
     res.setHeader('Content-Type', 'text/event-stream');
@@ -174,39 +172,60 @@ export class APIServer {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.status(200);
-    
-    // Send initial comment to flush headers immediately
-    res.write(': connected\n\n');
 
-    // Setup callbacks
+    // Setup callbacks BEFORE sending any data
     this.queue.setResponseCallback(requestId, (data: string) => {
-      console.log(`Sending SSE data for ${requestId}: ${data.substring(0, 50)}...`);
-      // Convert to OpenAI format for litellm compatibility
-      const openaiData = convertToOpenAIFormat(data);
-      res.write(`data: ${openaiData}\n\n`);
+      if (!isCompleted && res.writable) {
+        console.log(`[API] Sending SSE data for ${requestId}: ${data.substring(0, 50)}...`);
+        // Convert to OpenAI format for litellm compatibility
+        const openaiData = convertToOpenAIFormat(data);
+        try {
+          res.write(`data: ${openaiData}\n\n`);
+        } catch (error) {
+          console.error(`[API] Error writing to response: ${error}`);
+          isCompleted = true;
+        }
+      }
     });
 
     this.queue.setErrorCallback(requestId, (error: string) => {
-      console.error(`Error for ${requestId}: ${error}`);
-      res.write(`data: ${JSON.stringify({ error: error })}\n\n`);
-      res.end();
+      if (!isCompleted) {
+        console.error(`[API] Error for ${requestId}: ${error}`);
+        isCompleted = true;
+        try {
+          res.write(`data: ${JSON.stringify({ error: error })}\n\n`);
+          res.end();
+        } catch (error) {
+          console.error(`[API] Error ending response: ${error}`);
+        }
+      }
     });
 
     this.queue.setCompleteCallback(requestId, () => {
-      console.log(`Request ${requestId} completed`);
-      // Send final message with finish_reason
-      res.write(`data: ${JSON.stringify({
-        choices: [
-          {
-            delta: {},
-            index: 0,
-            finish_reason: 'stop'
-          }
-        ]
-      })}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
+      if (!isCompleted) {
+        console.log(`[API] Request ${requestId} completed`);
+        isCompleted = true;
+        try {
+          // Send final message with finish_reason
+          res.write(`data: ${JSON.stringify({
+            choices: [
+              {
+                delta: {},
+                index: 0,
+                finish_reason: 'stop'
+              }
+            ]
+          })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+        } catch (error) {
+          console.error(`[API] Error ending response: ${error}`);
+        }
+      }
     });
+    
+    // Send initial comment to flush headers immediately
+    res.write(': connected\n\n');
 
     // Send message to client
     const message: WebSocketMessage = {
@@ -215,31 +234,33 @@ export class APIServer {
       content: request.messages[request.messages.length - 1].content,
     };
 
-    console.log(`Sending message to client ${clientId}: ${(message.content || '').substring(0, 50)}...`);
+    console.log(`[API] Sending message to client ${clientId}: ${(message.content || '').substring(0, 50)}...`);
     
     this.wsManager.sendMessage(clientId, message).then(() => {
-      console.log(`Message sent successfully to client ${clientId}`);
+      console.log(`[API] Message sent successfully to client ${clientId}`);
     }).catch((error) => {
-      console.error(`Failed to send message to client: ${error}`);
-      this.queue.handleError(requestId, 'Failed to send message to client');
-      res.write(`data: {"error": "Failed to send message to client"}\n\n`);
-      res.end();
+      console.error(`[API] Failed to send message to client: ${error}`);
+      if (!isCompleted) {
+        isCompleted = true;
+        this.queue.handleError(requestId, 'Failed to send message to client');
+        try {
+          res.write(`data: {"error": "Failed to send message to client"}\n\n`);
+          res.end();
+        } catch (error) {
+          console.error(`[API] Error ending response: ${error}`);
+        }
+      }
     });
   }
 
   private handleNonStreamingResponse(req: Request, res: Response, requestId: string, clientId: string, request: ChatCompletionRequest) {
     let fullContent = '';
     let hasError = false;
-
-    // Handle client disconnect FIRST
-    req.on('close', () => {
-      console.log(`Client disconnected for request ${requestId}`);
-      this.queue.removeRequest(requestId);
-    });
+    let isCompleted = false;
 
     // Setup callbacks to collect all data
     this.queue.setResponseCallback(requestId, (data: string) => {
-      console.log(`Collecting data for ${requestId}: ${data.substring(0, 50)}...`);
+      console.log(`[API] Collecting data for ${requestId}: ${data.substring(0, 50)}...`);
       try {
         const obj = JSON.parse(data);
         
@@ -257,35 +278,41 @@ export class APIServer {
     });
 
     this.queue.setErrorCallback(requestId, (error: string) => {
-      console.error(`Error for ${requestId}: ${error}`);
-      hasError = true;
-      res.status(500).json({ error: error });
+      if (!isCompleted) {
+        console.error(`[API] Error for ${requestId}: ${error}`);
+        isCompleted = true;
+        hasError = true;
+        res.status(500).json({ error: error });
+      }
     });
 
     this.queue.setCompleteCallback(requestId, () => {
-      console.log(`Request ${requestId} completed with content: ${fullContent.substring(0, 50)}...`);
-      
-      if (!hasError) {
-        // Return complete response in OpenAI format
-        res.json({
-          id: requestId,
-          object: 'text_completion',
-          created: Math.floor(Date.now() / 1000),
-          model: request.model || 'doubao',
-          choices: [
-            {
-              text: fullContent,
-              index: 0,
-              logprobs: null,
-              finish_reason: 'stop'
+      if (!isCompleted) {
+        console.log(`[API] Request ${requestId} completed with content: ${fullContent.substring(0, 50)}...`);
+        isCompleted = true;
+        
+        if (!hasError) {
+          // Return complete response in OpenAI format
+          res.json({
+            id: requestId,
+            object: 'text_completion',
+            created: Math.floor(Date.now() / 1000),
+            model: request.model || 'doubao',
+            choices: [
+              {
+                text: fullContent,
+                index: 0,
+                logprobs: null,
+                finish_reason: 'stop'
+              }
+            ],
+            usage: {
+              prompt_tokens: 0,
+              completion_tokens: 0,
+              total_tokens: 0
             }
-          ],
-          usage: {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0
-          }
-        });
+          });
+        }
       }
     });
 
@@ -296,14 +323,17 @@ export class APIServer {
       content: request.messages[request.messages.length - 1].content,
     };
 
-    console.log(`Sending message to client ${clientId}: ${(message.content || '').substring(0, 50)}...`);
+    console.log(`[API] Sending message to client ${clientId}: ${(message.content || '').substring(0, 50)}...`);
     
     this.wsManager.sendMessage(clientId, message).then(() => {
-      console.log(`Message sent successfully to client ${clientId}`);
+      console.log(`[API] Message sent successfully to client ${clientId}`);
     }).catch((error) => {
-      console.error(`Failed to send message to client: ${error}`);
-      this.queue.handleError(requestId, 'Failed to send message to client');
-      res.status(500).json({ error: 'Failed to send message to client' });
+      console.error(`[API] Failed to send message to client: ${error}`);
+      if (!isCompleted) {
+        isCompleted = true;
+        this.queue.handleError(requestId, 'Failed to send message to client');
+        res.status(500).json({ error: 'Failed to send message to client' });
+      }
     });
   }
 

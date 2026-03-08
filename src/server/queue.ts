@@ -163,11 +163,20 @@ export class RequestQueue {
   }
 
   public handleSSEData(id: string, data: string) {
+    console.log(`[Queue] handleSSEData called for ${id}`);
     const req = this.queue.get(id);
-    if (req && req.responseCallback) {
-      // Filter sensitive fields before sending to client
-      const filteredData = filterSSEData(data);
-      req.responseCallback(filteredData);
+    if (req) {
+      console.log(`[Queue] Request found, responseCallback exists: ${!!req.responseCallback}`);
+      if (req.responseCallback) {
+        console.log(`[Queue] Calling responseCallback`);
+        // Filter sensitive fields before sending to client
+        const filteredData = filterSSEData(data);
+        req.responseCallback(filteredData);
+      } else {
+        console.log(`[Queue] No responseCallback set for ${id}`);
+      }
+    } else {
+      console.log(`[Queue] Request not found for ${id}`);
     }
   }
 

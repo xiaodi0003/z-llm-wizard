@@ -116,9 +116,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // Initialize connection
 connectWebSocket();
 
-// Periodic heartbeat check
+// Periodic heartbeat check to keep service worker alive
 setInterval(() => {
+  console.log('[Heartbeat] Checking WebSocket connection...');
   if (!ws || ws.readyState !== WebSocket.OPEN) {
+    console.log('[Heartbeat] WebSocket not connected, attempting to reconnect');
     connectWebSocket();
+  } else {
+    console.log('[Heartbeat] WebSocket is connected');
   }
-}, 30000);
+}, 10000); // Check every 10 seconds instead of 30
+
+// Also send a ping to keep the connection alive
+setInterval(() => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    console.log('[Ping] Sending ping to server');
+    try {
+      ws.send(JSON.stringify({ type: 'ping' }));
+    } catch (error) {
+      console.error('[Ping] Failed to send ping:', error);
+    }
+  }
+}, 15000); // Send ping every 15 seconds
