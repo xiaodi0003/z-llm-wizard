@@ -101,6 +101,18 @@ export class APIServer {
             object: 'model',
             owned_by: 'localdoubao',
             permission: []
+          },
+          {
+            id: 'deepseek-chat',
+            object: 'model',
+            owned_by: 'deepseek',
+            permission: []
+          },
+          {
+            id: 'deepseek-coder',
+            object: 'model',
+            owned_by: 'deepseek',
+            permission: []
           }
         ]
       });
