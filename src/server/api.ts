@@ -1,0 +1,313 @@
+import { Express, Request, Response } from 'express';
+import { ChatCompletionRequest, WebSocketMessage } from '../types';
+import { WebSocketManager } from './websocket';
+import { RequestQueue } from './queue';
+
+// Convert Douyin response to OpenAI-compatible format
+function convertToOpenAIFormat(data: string): string {
+  try {
+    const obj = JSON.parse(data);
+    
+    // Extract text content from various response formats
+    let textContent = '';
+    
+    // Format 1: Direct text field
+    if (obj.text) {
+      textContent = obj.text;
+    }
+    // Format 2: Content block with text
+    else if (obj.content?.content_block?.[0]?.content?.text_block?.text) {
+      textContent = obj.content.content_block[0].content.text_block.text;
+    }
+    // Format 3: Patch operation with text
+    else if (obj.patch_op?.[0]?.patch_value?.content_block?.[0]?.content?.text_block?.text) {
+      textContent = obj.patch_op[0].patch_value.content_block[0].content.text_block.text;
+    }
+    
+    // If we found text content, convert to OpenAI format
+    if (textContent) {
+      return JSON.stringify({
+        choices: [
+          {
+            delta: {
+              content: textContent
+            },
+            index: 0,
+            finish_reason: null
+          }
+        ]
+      });
+    }
+    
+    // For non-text messages, return empty delta
+    return JSON.stringify({
+      choices: [
+        {
+          delta: {},
+          index: 0,
+          finish_reason: null
+        }
+      ]
+    });
+  } catch (error) {
+    // If not JSON, return empty delta
+    return JSON.stringify({
+      choices: [
+        {
+          delta: {},
+          index: 0,
+          finish_reason: null
+        }
+      ]
+    });
+  }
+}
+
+export class APIServer {
+  private app: Express;
+  private wsManager: WebSocketManager;
+  private queue: RequestQueue;
+
+  constructor(app: Express, wsManager: WebSocketManager, queue: RequestQueue) {
+    this.app = app;
+    this.wsManager = wsManager;
+    this.queue = queue;
+    this.setupRoutes();
+  }
+
+  private setupRoutes() {
+    // Health check endpoint
+    this.app.get('/health', (req: Request, res: Response) => {
+      res.json({ 
+        status: 'ok',
+        clients: this.wsManager.getClientCount(),
+        timestamp: new Date().toISOString()
+      });
+    });
+
+    // Models endpoint for litellm compatibility
+    this.app.get('/v1/models', (req: Request, res: Response) => {
+      res.json({
+        object: 'list',
+        data: [
+          {
+            id: 'doubao',
+            object: 'model',
+            owned_by: 'doubao',
+            permission: []
+          },
+          {
+            id: 'localdoubao/llm',
+            object: 'model',
+            owned_by: 'localdoubao',
+            permission: []
+          }
+        ]
+      });
+    });
+    
+    this.app.post('/chat/completions', (req: Request, res: Response) => {
+      this.handleChatCompletions(req, res);
+    });
+    // Also support OpenAI-compatible v1 endpoint
+    this.app.post('/v1/chat/completions', (req: Request, res: Response) => {
+      this.handleChatCompletions(req, res);
+    });
+  }
+
+  private async handleChatCompletions(req: Request, res: Response) {
+    try {
+      console.log('Received chat completions request');
+      
+      // Validate request
+      const request: ChatCompletionRequest = req.body;
+      if (!request.messages || !Array.isArray(request.messages)) {
+        console.error('Invalid request format:', request);
+        res.status(400).json({ error: 'Invalid request format' });
+        return;
+      }
+
+      // Check if streaming is requested (default: true)
+      const stream = request.stream !== false;
+      console.log(`Stream mode: ${stream}`);
+
+      console.log('Request validated, checking for available clients');
+      
+      // Check if client is available
+      const clientId = this.wsManager.getAvailableClient();
+      const clientCount = this.wsManager.getClientCount();
+      console.log(`Available clients: ${clientCount}, selected client: ${clientId}`);
+      
+      if (!clientId) {
+        console.error('No available clients');
+        res.status(503).json({ error: 'No available clients' });
+        return;
+      }
+
+      // Add request to queue
+      const requestId = this.queue.addRequest(request);
+      console.log(`Request queued with ID: ${requestId}`);
+
+      if (stream) {
+        // Streaming response
+        this.handleStreamingResponse(req, res, requestId, clientId, request);
+      } else {
+        // Non-streaming response - collect all data first
+        this.handleNonStreamingResponse(req, res, requestId, clientId, request);
+      }
+    } catch (error) {
+      console.error('Error handling chat completions:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+
+  private handleStreamingResponse(req: Request, res: Response, requestId: string, clientId: string, request: ChatCompletionRequest) {
+    // Handle client disconnect FIRST
+    req.on('close', () => {
+      console.log(`Client disconnected for request ${requestId}`);
+      this.queue.removeRequest(requestId);
+    });
+
+    // Setup SSE response
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.status(200);
+    
+    // Send initial comment to flush headers immediately
+    res.write(': connected\n\n');
+
+    // Setup callbacks
+    this.queue.setResponseCallback(requestId, (data: string) => {
+      console.log(`Sending SSE data for ${requestId}: ${data.substring(0, 50)}...`);
+      // Convert to OpenAI format for litellm compatibility
+      const openaiData = convertToOpenAIFormat(data);
+      res.write(`data: ${openaiData}\n\n`);
+    });
+
+    this.queue.setErrorCallback(requestId, (error: string) => {
+      console.error(`Error for ${requestId}: ${error}`);
+      res.write(`data: ${JSON.stringify({ error: error })}\n\n`);
+      res.end();
+    });
+
+    this.queue.setCompleteCallback(requestId, () => {
+      console.log(`Request ${requestId} completed`);
+      // Send final message with finish_reason
+      res.write(`data: ${JSON.stringify({
+        choices: [
+          {
+            delta: {},
+            index: 0,
+            finish_reason: 'stop'
+          }
+        ]
+      })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+
+    // Send message to client
+    const message: WebSocketMessage = {
+      type: 'message',
+      id: requestId,
+      content: request.messages[request.messages.length - 1].content,
+    };
+
+    console.log(`Sending message to client ${clientId}: ${(message.content || '').substring(0, 50)}...`);
+    
+    this.wsManager.sendMessage(clientId, message).then(() => {
+      console.log(`Message sent successfully to client ${clientId}`);
+    }).catch((error) => {
+      console.error(`Failed to send message to client: ${error}`);
+      this.queue.handleError(requestId, 'Failed to send message to client');
+      res.write(`data: {"error": "Failed to send message to client"}\n\n`);
+      res.end();
+    });
+  }
+
+  private handleNonStreamingResponse(req: Request, res: Response, requestId: string, clientId: string, request: ChatCompletionRequest) {
+    let fullContent = '';
+    let hasError = false;
+
+    // Handle client disconnect FIRST
+    req.on('close', () => {
+      console.log(`Client disconnected for request ${requestId}`);
+      this.queue.removeRequest(requestId);
+    });
+
+    // Setup callbacks to collect all data
+    this.queue.setResponseCallback(requestId, (data: string) => {
+      console.log(`Collecting data for ${requestId}: ${data.substring(0, 50)}...`);
+      try {
+        const obj = JSON.parse(data);
+        
+        // Extract text content from various response formats
+        if (obj.text) {
+          fullContent += obj.text;
+        } else if (obj.content?.content_block?.[0]?.content?.text_block?.text) {
+          fullContent += obj.content.content_block[0].content.text_block.text;
+        } else if (obj.patch_op?.[0]?.patch_value?.content_block?.[0]?.content?.text_block?.text) {
+          fullContent += obj.patch_op[0].patch_value.content_block[0].content.text_block.text;
+        }
+      } catch (error) {
+        // Ignore parse errors, just skip this chunk
+      }
+    });
+
+    this.queue.setErrorCallback(requestId, (error: string) => {
+      console.error(`Error for ${requestId}: ${error}`);
+      hasError = true;
+      res.status(500).json({ error: error });
+    });
+
+    this.queue.setCompleteCallback(requestId, () => {
+      console.log(`Request ${requestId} completed with content: ${fullContent.substring(0, 50)}...`);
+      
+      if (!hasError) {
+        // Return complete response in OpenAI format
+        res.json({
+          id: requestId,
+          object: 'text_completion',
+          created: Math.floor(Date.now() / 1000),
+          model: request.model || 'doubao',
+          choices: [
+            {
+              text: fullContent,
+              index: 0,
+              logprobs: null,
+              finish_reason: 'stop'
+            }
+          ],
+          usage: {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0
+          }
+        });
+      }
+    });
+
+    // Send message to client
+    const message: WebSocketMessage = {
+      type: 'message',
+      id: requestId,
+      content: request.messages[request.messages.length - 1].content,
+    };
+
+    console.log(`Sending message to client ${clientId}: ${(message.content || '').substring(0, 50)}...`);
+    
+    this.wsManager.sendMessage(clientId, message).then(() => {
+      console.log(`Message sent successfully to client ${clientId}`);
+    }).catch((error) => {
+      console.error(`Failed to send message to client: ${error}`);
+      this.queue.handleError(requestId, 'Failed to send message to client');
+      res.status(500).json({ error: 'Failed to send message to client' });
+    });
+  }
+
+  public getApp(): Express {
+    return this.app;
+  }
+}

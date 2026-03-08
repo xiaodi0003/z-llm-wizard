@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "LLM Proxy Service",
+  "version": "1.0.0",
+  "description": "Chrome extension for LLM proxy service",
+  "permissions": [
+    "webRequest",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://*.doubao.com/*",
+    "https://www.doubao.com/*",
+    "https://doubao.com/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.doubao.com/*",
+        "https://www.doubao.com/*",
+        "https://doubao.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": [
+        "https://*.doubao.com/*",
+        "https://www.doubao.com/*",
+        "https://doubao.com/*"
+      ]
+    }
+  ],
+  "action": {
+    "default_title": "LLM Proxy Service"
+  }
+}
