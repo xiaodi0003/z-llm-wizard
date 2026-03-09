@@ -9,6 +9,26 @@ console.log('=== LLM Proxy Content Script Loaded ===');
 
 let currentRequestId: string | null = null;
 let isWaitingForResponse = false;
+const sseDataBuffer: string[] = [];
+let isBackgroundConnected = false;
+
+// Check background worker connection status periodically
+async function checkBackgroundConnection() {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: 'get_connection_status'
+    });
+    isBackgroundConnected = response.status === 'connected';
+    console.log('[Connection] Background worker status:', response.status);
+  } catch (error) {
+    isBackgroundConnected = false;
+    console.log('[Connection] Background worker not responding');
+  }
+}
+
+// Check connection every 5 seconds
+setInterval(checkBackgroundConnection, 5000);
+checkBackgroundConnection();
 
 // Inject the fetch interceptor script into the page context
 console.log('About to inject script from file');
@@ -380,17 +400,57 @@ async function handleSSEResponse(response: Response) {
 function sendSSEDataToBackground(data: string) {
   if (!currentRequestId) return;
 
+  // Buffer the data if background worker is not connected
+  if (!isBackgroundConnected) {
+    console.log('[Buffer] Background not connected, buffering SSE data');
+    sseDataBuffer.push(data);
+    return;
+  }
+
+  // Send buffered data first if any
+  if (sseDataBuffer.length > 0) {
+    console.log('[Buffer] Sending', sseDataBuffer.length, 'buffered messages');
+    sseDataBuffer.forEach(bufferedData => {
+      chrome.runtime.sendMessage({
+        type: 'sse',
+        id: currentRequestId,
+        data: bufferedData,
+      }).catch((error) => {
+        console.error('[Buffer] Failed to send buffered SSE data:', error);
+      });
+    });
+    sseDataBuffer.length = 0;
+  }
+
+  // Send current data
   chrome.runtime.sendMessage({
     type: 'sse',
     id: currentRequestId,
     data: data,
   }).catch((error) => {
     console.error('Failed to send SSE data to background:', error);
+    // Re-buffer if send fails
+    sseDataBuffer.push(data);
   });
 }
 
 function sendDoneToBackground() {
   if (!currentRequestId) return;
+
+  // Send any remaining buffered data
+  if (sseDataBuffer.length > 0) {
+    console.log('[Buffer] Sending', sseDataBuffer.length, 'buffered messages before done');
+    sseDataBuffer.forEach(bufferedData => {
+      chrome.runtime.sendMessage({
+        type: 'sse',
+        id: currentRequestId,
+        data: bufferedData,
+      }).catch((error) => {
+        console.error('[Buffer] Failed to send buffered SSE data:', error);
+      });
+    });
+    sseDataBuffer.length = 0;
+  }
 
   chrome.runtime.sendMessage({
     type: 'done',
@@ -416,4 +476,5 @@ function sendErrorToBackground(error: string) {
 
   currentRequestId = null;
   isWaitingForResponse = false;
+  sseDataBuffer.length = 0;
 }

@@ -6,7 +6,8 @@
   "permissions": [
     "webRequest",
     "tabs",
-    "scripting"
+    "scripting",
+    "storage"
   ],
   "host_permissions": [
     "https://*.doubao.com/*",
