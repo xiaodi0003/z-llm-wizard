@@ -374,31 +374,70 @@ function handleServerMessage(message: any) {
 }
 
 // Wait for Content Script to be ready and send message
-async function waitForContentScriptReady(tabId: number, message: any, maxWaitTime: number = 15000): Promise<void> {
+async function waitForContentScriptReady(tabId: number, message: any, maxWaitTime: number = 20000): Promise<void> {
   const startTime = Date.now();
-  const checkInterval = 500;
+  const checkInterval = 300; // Check more frequently
   
-  while (Date.now() - startTime < maxWaitTime) {
+  // Step 1: Wait for Content Script to be ready
+  console.log(`[Server] Waiting for Content Script on tab ${tabId}...`);
+  let contentScriptReady = false;
+  while (Date.now() - startTime < maxWaitTime && !contentScriptReady) {
     try {
-      // Try to send a ping to check if Content Script is ready
       const response = await chrome.tabs.sendMessage(tabId, { type: 'ping' });
       if (response && response.pong) {
-        console.log('[Server] Content Script is ready on tab', tabId);
-        // Now send the actual message
-        await chrome.tabs.sendMessage(tabId, message);
-        console.log('[Server] Message sent successfully to tab', tabId);
-        return;
+        console.log(`[Server] Content Script is ready on tab ${tabId}`);
+        contentScriptReady = true;
+        break;
       }
     } catch (error) {
-      // Content Script not ready yet, wait and retry
-      console.log('[Server] Content Script not ready yet, waiting...');
+      console.log(`[Server] Content Script not ready yet on tab ${tabId}, waiting...`);
     }
     
-    // Wait before retrying
     await new Promise(resolve => setTimeout(resolve, checkInterval));
   }
   
-  throw new Error(`Content Script not ready on tab ${tabId} after ${maxWaitTime}ms`);
+  if (!contentScriptReady) {
+    throw new Error(`Content Script not ready on tab ${tabId} after ${maxWaitTime}ms`);
+  }
+  
+  // Step 2: Wait for page to be fully loaded and elements to be ready
+  console.log(`[Server] Waiting for page elements on tab ${tabId}...`);
+  const pageReadyStartTime = Date.now();
+  let pageReady = false;
+  let retryCount = 0;
+  
+  while (Date.now() - pageReadyStartTime < maxWaitTime && !pageReady) {
+    try {
+      const response = await chrome.tabs.sendMessage(tabId, { type: 'check_page_ready' });
+      if (response && response.ready) {
+        console.log(`[Server] Page elements are ready on tab ${tabId} (retry ${retryCount})`);
+        pageReady = true;
+        break;
+      } else {
+        retryCount++;
+        if (retryCount % 10 === 0) {
+          console.log(`[Server] Page elements not ready yet on tab ${tabId}, retry ${retryCount}...`);
+        }
+      }
+    } catch (error) {
+      console.log(`[Server] Error checking page ready on tab ${tabId}:`, error);
+    }
+    
+    await new Promise(resolve => setTimeout(resolve, checkInterval));
+  }
+  
+  if (!pageReady) {
+    throw new Error(`Page elements not ready on tab ${tabId} after ${maxWaitTime}ms`);
+  }
+  
+  // Step 3: Send the actual message
+  console.log(`[Server] Sending message to tab ${tabId}...`);
+  try {
+    await chrome.tabs.sendMessage(tabId, message);
+    console.log(`[Server] Message sent successfully to tab ${tabId}`);
+  } catch (error) {
+    throw new Error(`Failed to send message to tab ${tabId}: ${error}`);
+  }
 }
 
 function sendToServer(message: any) {

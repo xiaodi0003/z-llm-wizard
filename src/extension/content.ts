@@ -108,69 +108,93 @@ chrome.runtime.onMessage.addListener((message: MessageData, sender, sendResponse
   } else if (message.type === 'ping') {
     console.log('Ping received, responding with pong');
     sendResponse({ pong: true });
+  } else if (message.type === 'check_page_ready') {
+    // Check if page is fully loaded and elements are ready
+    const isPageReady = isPageFullyLoaded();
+    const inputBox = findInputBox();
+    const sendButton = findSendButton();
+    const isReady = isPageReady && inputBox !== null && sendButton !== null;
+    console.log('[PageReady] Document ready:', isPageReady, 'Input box:', inputBox !== null, 'Send button:', sendButton !== null);
+    sendResponse({ ready: isReady });
   }
 });
 
 async function handleIncomingMessage(content: string) {
-  console.log('handleIncomingMessage called with:', content);
+  console.log('handleIncomingMessage called with:', content.substring(0, 50));
   
-  // Wait for page to load (max 10 seconds)
-  const inputBox = await waitForElement(() => findInputBox(), 10000);
-  if (!inputBox) {
-    console.error('Could not find input box after waiting');
-    console.log('Available elements:', document.querySelectorAll('textarea, input[type="text"]').length);
-    sendErrorToBackground('Could not find input box - page may not have loaded');
-    return;
+  try {
+    // Wait for page to load (max 15 seconds)
+    console.log('[Message] Waiting for input box...');
+    const inputBox = await waitForElement(() => findInputBox(), 15000);
+    if (!inputBox) {
+      console.error('Could not find input box after waiting');
+      console.log('Available textareas:', document.querySelectorAll('textarea').length);
+      console.log('Available inputs:', document.querySelectorAll('input[type="text"]').length);
+      sendErrorToBackground('Could not find input box - page may not have loaded');
+      return;
+    }
+
+    console.log('Found input box:', inputBox.tagName, 'class:', inputBox.className);
+
+    // Set the input value
+    setInputValue(inputBox, content);
+    console.log('Input value set, content length:', content.length);
+
+    // Wait for send button to load
+    console.log('[Message] Waiting for send button...');
+    const sendButton = await waitForElement(() => findSendButton(), 15000);
+    if (!sendButton) {
+      console.error('Could not find send button after waiting');
+      console.log('Available buttons:', document.querySelectorAll('button').length);
+      sendErrorToBackground('Could not find send button - page may not have loaded');
+      return;
+    }
+
+    console.log('Found send button:', sendButton.textContent, 'id:', sendButton.id);
+
+    // Click the send button
+    console.log('About to click send button');
+    sendButton.click();
+    console.log('Send button clicked - waiting for response');
+    
+    // Wait a bit and check if fetch was called
+    setTimeout(() => {
+      console.log('Waited 2 seconds - if no fetch logs appeared, fetch was not called');
+    }, 2000);
+  } catch (error) {
+    console.error('Error in handleIncomingMessage:', error);
+    sendErrorToBackground(`Error handling message: ${error}`);
   }
-
-  console.log('Found input box:', inputBox.tagName);
-
-  // Set the input value
-  setInputValue(inputBox, content);
-  console.log('Input value set');
-
-  // Wait for send button to load
-  const sendButton = await waitForElement(() => findSendButton(), 10000);
-  if (!sendButton) {
-    console.error('Could not find send button after waiting');
-    console.log('Available buttons:', document.querySelectorAll('button').length);
-    sendErrorToBackground('Could not find send button - page may not have loaded');
-    return;
-  }
-
-  console.log('Found send button:', sendButton.textContent);
-
-  // Click the send button
-  console.log('About to click send button');
-  sendButton.click();
-  console.log('Send button clicked - waiting for response');
-  
-  // Wait a bit and check if fetch was called
-  setTimeout(() => {
-    console.log('Waited 2 seconds - if no fetch logs appeared, fetch was not called');
-  }, 2000);
 }
 
 // Helper function to wait for an element to appear
 async function waitForElement(
   findFn: () => HTMLElement | null,
-  maxWaitTime: number = 10000,
-  checkInterval: number = 500
+  maxWaitTime: number = 15000,
+  checkInterval: number = 300
 ): Promise<HTMLElement | null> {
   const startTime = Date.now();
+  let attemptCount = 0;
   
   while (Date.now() - startTime < maxWaitTime) {
     const element = findFn();
     if (element) {
-      console.log('[WaitForElement] Element found after', Date.now() - startTime, 'ms');
+      const elapsedTime = Date.now() - startTime;
+      console.log('[WaitForElement] Element found after', elapsedTime, 'ms (attempt', attemptCount, ')');
       return element;
+    }
+    
+    attemptCount++;
+    if (attemptCount % 10 === 0) {
+      console.log('[WaitForElement] Still waiting for element... (attempt', attemptCount, ')');
     }
     
     // Wait before checking again
     await new Promise(resolve => setTimeout(resolve, checkInterval));
   }
   
-  console.log('[WaitForElement] Element not found after', maxWaitTime, 'ms');
+  const elapsedTime = Date.now() - startTime;
+  console.log('[WaitForElement] Element not found after', elapsedTime, 'ms (', attemptCount, 'attempts)');
   return null;
 }
 
@@ -293,6 +317,31 @@ function setInputValue(element: HTMLTextAreaElement | HTMLInputElement | Element
 function isVisible(element: Element): boolean {
   const style = window.getComputedStyle(element);
   return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+}
+
+// Check if page is fully loaded
+function isPageFullyLoaded(): boolean {
+  // Check document ready state
+  if (document.readyState !== 'complete' && document.readyState !== 'interactive') {
+    console.log('[PageReady] Document not ready, readyState:', document.readyState);
+    return false;
+  }
+  
+  // Check if DOM is interactive
+  if (!document.body) {
+    console.log('[PageReady] Document body not available');
+    return false;
+  }
+  
+  // Check if main content is loaded (豆包 specific)
+  const mainContent = document.querySelector('[class*="chat"], [class*="message"], main, [role="main"]');
+  if (!mainContent) {
+    console.log('[PageReady] Main content not found');
+    return false;
+  }
+  
+  console.log('[PageReady] Page is fully loaded');
+  return true;
 }
 
 function setupXHRInterception() {

@@ -4,7 +4,8 @@ import { WebSocketManager } from './websocket';
 import { RequestQueue } from './queue';
 
 // Convert Douyin response to OpenAI-compatible format
-function convertToOpenAIFormat(data: string, requestId: string, model: string): string {
+// Returns null if no content to send (empty delta)
+function convertToOpenAIFormat(data: string, requestId: string, model: string): string | null {
   try {
     const obj = JSON.parse(data);
     
@@ -24,7 +25,13 @@ function convertToOpenAIFormat(data: string, requestId: string, model: string): 
       textContent = obj.patch_op[0].patch_value.content_block[0].content.text_block.text;
     }
     
-    // Build standard OpenAI format response
+    // If no content found, return null to skip this message
+    if (!textContent || textContent.trim() === '') {
+      console.log(`[API] Skipping empty content for ${requestId}`);
+      return null;
+    }
+    
+    // Build standard OpenAI format response with content
     const response: any = {
       id: requestId,
       object: 'chat.completion.chunk',
@@ -33,7 +40,7 @@ function convertToOpenAIFormat(data: string, requestId: string, model: string): 
       choices: [
         {
           index: 0,
-          delta: textContent ? { role: 'assistant', content: textContent } : {},
+          delta: { role: 'assistant', content: textContent },
           finish_reason: null
         }
       ],
@@ -52,31 +59,9 @@ function convertToOpenAIFormat(data: string, requestId: string, model: string): 
     
     return JSON.stringify(response);
   } catch (error) {
-    // If not JSON, return empty delta with standard format
-    return JSON.stringify({
-      id: requestId,
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      model: model,
-      choices: [
-        {
-          index: 0,
-          delta: {},
-          finish_reason: null
-        }
-      ],
-      usage: {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-        prompt_tokens_details: {
-          cached_tokens: 0
-        },
-        completion_tokens_details: {
-          reasoning_tokens: 0
-        }
-      }
-    });
+    // If not JSON, return null to skip
+    console.log(`[API] Skipping non-JSON data: ${data.substring(0, 50)}`);
+    return null;
   }
 }
 
@@ -208,11 +193,14 @@ export class APIServer {
         console.log(`[API] Sending SSE data for ${requestId}: ${data.substring(0, 50)}...`);
         // Convert to OpenAI format for litellm compatibility
         const openaiData = convertToOpenAIFormat(data, requestId, request.model || 'doubao');
-        try {
-          res.write(`data: ${openaiData}\n\n`);
-        } catch (error) {
-          console.error(`[API] Error writing to response: ${error}`);
-          isCompleted = true;
+        // Only send if there's actual content (skip empty deltas)
+        if (openaiData) {
+          try {
+            res.write(`data: ${openaiData}\n\n`);
+          } catch (error) {
+            console.error(`[API] Error writing to response: ${error}`);
+            isCompleted = true;
+          }
         }
       }
     });
