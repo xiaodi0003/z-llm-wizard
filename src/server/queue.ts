@@ -169,7 +169,7 @@ export class RequestQueue {
       console.log(`[Queue] Request found, responseCallback exists: ${!!req.responseCallback}`);
       if (req.responseCallback) {
         console.log(`[Queue] Calling responseCallback`);
-        // Filter sensitive fields before sending to client
+        // Filter sensitive fields from raw Douyin data before conversion
         const filteredData = filterSSEData(data);
         req.responseCallback(filteredData);
       } else {

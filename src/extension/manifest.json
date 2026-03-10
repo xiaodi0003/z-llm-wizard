@@ -4,7 +4,6 @@
   "version": "1.0.0",
   "description": "Chrome extension for LLM proxy service",
   "permissions": [
-    "webRequest",
     "tabs",
     "scripting",
     "storage"
@@ -12,11 +11,11 @@
   "host_permissions": [
     "https://*.doubao.com/*",
     "https://www.doubao.com/*",
-    "https://doubao.com/*",
-    "<all_urls>"
+    "https://doubao.com/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "content_scripts": [
     {

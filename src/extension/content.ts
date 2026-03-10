@@ -91,23 +91,35 @@ chrome.runtime.onMessage.addListener((message: MessageData, sender, sendResponse
     currentRequestId = message.id;
     isWaitingForResponse = true;
     console.log('Processing incoming message with ID:', currentRequestId);
-    handleIncomingMessage(message.content || '');
-    sendResponse({ success: true });
+    
+    // Handle async message processing
+    handleIncomingMessage(message.content || '')
+      .then(() => {
+        console.log('Message handling completed');
+        sendResponse({ success: true });
+      })
+      .catch((error) => {
+        console.error('Error handling message:', error);
+        sendResponse({ success: false, error: error.message });
+      });
+    
+    // Return true to indicate we'll send response asynchronously
+    return true;
   } else if (message.type === 'ping') {
     console.log('Ping received, responding with pong');
     sendResponse({ pong: true });
   }
 });
 
-function handleIncomingMessage(content: string) {
+async function handleIncomingMessage(content: string) {
   console.log('handleIncomingMessage called with:', content);
   
-  // Find and fill the input box
-  const inputBox = findInputBox();
+  // Wait for page to load (max 10 seconds)
+  const inputBox = await waitForElement(() => findInputBox(), 10000);
   if (!inputBox) {
-    console.error('Could not find input box');
+    console.error('Could not find input box after waiting');
     console.log('Available elements:', document.querySelectorAll('textarea, input[type="text"]').length);
-    sendErrorToBackground('Could not find input box');
+    sendErrorToBackground('Could not find input box - page may not have loaded');
     return;
   }
 
@@ -117,12 +129,12 @@ function handleIncomingMessage(content: string) {
   setInputValue(inputBox, content);
   console.log('Input value set');
 
-  // Find and click the send button
-  const sendButton = findSendButton();
+  // Wait for send button to load
+  const sendButton = await waitForElement(() => findSendButton(), 10000);
   if (!sendButton) {
-    console.error('Could not find send button');
+    console.error('Could not find send button after waiting');
     console.log('Available buttons:', document.querySelectorAll('button').length);
-    sendErrorToBackground('Could not find send button');
+    sendErrorToBackground('Could not find send button - page may not have loaded');
     return;
   }
 
@@ -137,6 +149,29 @@ function handleIncomingMessage(content: string) {
   setTimeout(() => {
     console.log('Waited 2 seconds - if no fetch logs appeared, fetch was not called');
   }, 2000);
+}
+
+// Helper function to wait for an element to appear
+async function waitForElement(
+  findFn: () => HTMLElement | null,
+  maxWaitTime: number = 10000,
+  checkInterval: number = 500
+): Promise<HTMLElement | null> {
+  const startTime = Date.now();
+  
+  while (Date.now() - startTime < maxWaitTime) {
+    const element = findFn();
+    if (element) {
+      console.log('[WaitForElement] Element found after', Date.now() - startTime, 'ms');
+      return element;
+    }
+    
+    // Wait before checking again
+    await new Promise(resolve => setTimeout(resolve, checkInterval));
+  }
+  
+  console.log('[WaitForElement] Element not found after', maxWaitTime, 'ms');
+  return null;
 }
 
 function findInputBox(): HTMLTextAreaElement | HTMLInputElement | null {

@@ -3,6 +3,223 @@ const INITIAL_RECONNECT_DELAY = 3000;
 const MAX_RECONNECT_DELAY = 30000;
 const STORAGE_KEY = 'pending_messages';
 
+// Import types from tab-pool
+interface TabInfo {
+  tabId: number;
+  url: string;
+  isIdle: boolean;
+  currentRequestId: string | null;
+  createdAt: number;
+  lastActivityAt: number;
+  isExtensionManaged: boolean;
+}
+
+interface PoolStatus {
+  totalTabs: number;
+  idleTabs: number;
+  busyTabs: number;
+  tabs: Array<{
+    tabId: number;
+    isIdle: boolean;
+    currentRequestId: string | null;
+    lastActivityAt: number;
+  }>;
+}
+
+// Active request tracking
+interface ActiveRequestInfo {
+  id: string;
+  tabId: number;
+  startTime: number;
+}
+
+// Tab pool manager for handling concurrent requests
+class TabPoolManager {
+  private tabPool: Map<number, TabInfo> = new Map();
+  private idleQueue: number[] = [];
+  private readonly MAX_TABS = 10;
+  private readonly IDLE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+  private readonly DOUYIN_URL = 'https://www.doubao.com/';
+  private cleanupIntervalId: NodeJS.Timeout | null = null;
+  private waitingRequests: Array<{
+    resolve: (tabId: number) => void;
+    reject: (error: Error) => void;
+  }> = [];
+
+  // Get available tab (reuse idle tab or create new one)
+  async getAvailableTab(): Promise<number> {
+    // 1. Check if there's an idle tab
+    if (this.idleQueue.length > 0) {
+      const tabId = this.idleQueue.shift()!;
+      const tabInfo = this.tabPool.get(tabId)!;
+      tabInfo.isIdle = false;
+      console.log(`[TabPool] Using idle tab: ${tabId}`);
+      return tabId;
+    }
+
+    // 2. If no idle tab, check if we can create a new one
+    if (this.tabPool.size < this.MAX_TABS) {
+      const tabId = await this.createNewTab();
+      console.log(`[TabPool] Created new tab: ${tabId}`);
+      return tabId;
+    }
+
+    // 3. If max tabs reached, wait for an idle tab
+    console.log(`[TabPool] Max tabs reached, waiting for idle tab...`);
+    return new Promise((resolve, reject) => {
+      this.waitingRequests.push({ resolve, reject });
+    });
+  }
+
+  // Create a new Douyin tab
+  private async createNewTab(): Promise<number> {
+    try {
+      const tab = await chrome.tabs.create({
+        url: this.DOUYIN_URL,
+        active: false
+      });
+
+      if (!tab.id) {
+        throw new Error('Failed to create tab: no tab ID');
+      }
+
+      const tabInfo: TabInfo = {
+        tabId: tab.id,
+        url: this.DOUYIN_URL,
+        isIdle: false,
+        currentRequestId: null,
+        createdAt: Date.now(),
+        lastActivityAt: Date.now(),
+        isExtensionManaged: true
+      };
+
+      this.tabPool.set(tab.id, tabInfo);
+      return tab.id;
+    } catch (error) {
+      console.error('[TabPool] Failed to create tab:', error);
+      throw error;
+    }
+  }
+
+  // Mark tab as idle
+  markTabAsIdle(tabId: number): void {
+    const tabInfo = this.tabPool.get(tabId);
+    if (tabInfo) {
+      tabInfo.isIdle = true;
+      tabInfo.currentRequestId = null;
+      tabInfo.lastActivityAt = Date.now();
+      this.idleQueue.push(tabId);
+      console.log(`[TabPool] Tab ${tabId} marked as idle`);
+
+      // Process waiting requests
+      if (this.waitingRequests.length > 0) {
+        const { resolve } = this.waitingRequests.shift()!;
+        const nextTabId = this.idleQueue.shift()!;
+        const nextTabInfo = this.tabPool.get(nextTabId)!;
+        nextTabInfo.isIdle = false;
+        console.log(`[TabPool] Assigned idle tab ${nextTabId} to waiting request`);
+        resolve(nextTabId);
+      }
+    }
+  }
+
+  // Mark tab as busy
+  markTabAsBusy(tabId: number, requestId: string): void {
+    const tabInfo = this.tabPool.get(tabId);
+    if (tabInfo) {
+      tabInfo.isIdle = false;
+      tabInfo.currentRequestId = requestId;
+      tabInfo.lastActivityAt = Date.now();
+      // Remove from idle queue
+      const index = this.idleQueue.indexOf(tabId);
+      if (index > -1) {
+        this.idleQueue.splice(index, 1);
+      }
+      console.log(`[TabPool] Tab ${tabId} marked as busy with request ${requestId}`);
+    }
+  }
+
+  // Start idle tab cleanup
+  startIdleTabCleanup(): void {
+    if (this.cleanupIntervalId !== null) {
+      return;
+    }
+
+    this.cleanupIntervalId = setInterval(() => {
+      const now = Date.now();
+      const tabsToClose: number[] = [];
+
+      this.tabPool.forEach((tabInfo, tabId) => {
+        if (
+          tabInfo.isIdle &&
+          tabInfo.isExtensionManaged &&
+          now - tabInfo.lastActivityAt > this.IDLE_TIMEOUT
+        ) {
+          tabsToClose.push(tabId);
+        }
+      });
+
+      tabsToClose.forEach((tabId) => {
+        chrome.tabs.remove(tabId).catch((error) => {
+          console.error(`[TabPool] Failed to close tab ${tabId}:`, error);
+        });
+        this.tabPool.delete(tabId);
+        const index = this.idleQueue.indexOf(tabId);
+        if (index > -1) {
+          this.idleQueue.splice(index, 1);
+        }
+        console.log(`[TabPool] Closed idle tab: ${tabId}`);
+      });
+    }, 60000); // Check every minute
+  }
+
+  // Stop idle tab cleanup
+  stopIdleTabCleanup(): void {
+    if (this.cleanupIntervalId !== null) {
+      clearInterval(this.cleanupIntervalId);
+      this.cleanupIntervalId = null;
+    }
+  }
+
+  // Get pool status
+  getPoolStatus(): PoolStatus {
+    return {
+      totalTabs: this.tabPool.size,
+      idleTabs: this.idleQueue.length,
+      busyTabs: this.tabPool.size - this.idleQueue.length,
+      tabs: Array.from(this.tabPool.values()).map((info) => ({
+        tabId: info.tabId,
+        isIdle: info.isIdle,
+        currentRequestId: info.currentRequestId,
+        lastActivityAt: info.lastActivityAt
+      }))
+    };
+  }
+
+  // Handle tab closed event
+  handleTabClosed(tabId: number): void {
+    const tabInfo = this.tabPool.get(tabId);
+    if (tabInfo && tabInfo.isExtensionManaged) {
+      this.tabPool.delete(tabId);
+      const index = this.idleQueue.indexOf(tabId);
+      if (index > -1) {
+        this.idleQueue.splice(index, 1);
+      }
+      console.log(`[TabPool] Tab ${tabId} closed`);
+    }
+  }
+
+  // Get tab info
+  getTabInfo(tabId: number): TabInfo | undefined {
+    return this.tabPool.get(tabId);
+  }
+
+  // Get all tabs
+  getAllTabs(): TabInfo[] {
+    return Array.from(this.tabPool.values());
+  }
+}
+
 interface PendingMessage {
   type: string;
   id: string;
@@ -14,10 +231,17 @@ let reconnectDelay = INITIAL_RECONNECT_DELAY;
 let reconnectTimeout: NodeJS.Timeout | null = null;
 const pendingMessages: Map<string, PendingMessage> = new Map();
 let isConnecting = false;
+const tabPoolManager = new TabPoolManager();
+const activeRequests: Map<string, ActiveRequestInfo> = new Map();
 
 // Load pending messages from storage on startup
 async function loadPendingMessages() {
   try {
+    if (!chrome.storage || !chrome.storage.local) {
+      console.log('[Storage] Chrome storage not available');
+      return;
+    }
+    
     const data = await chrome.storage.local.get(STORAGE_KEY);
     if (data[STORAGE_KEY]) {
       const messages = JSON.parse(data[STORAGE_KEY]);
@@ -34,6 +258,11 @@ async function loadPendingMessages() {
 // Save pending messages to storage
 async function savePendingMessages() {
   try {
+    if (!chrome.storage || !chrome.storage.local) {
+      console.log('[Storage] Chrome storage not available');
+      return;
+    }
+    
     const messages = Array.from(pendingMessages.values());
     await chrome.storage.local.set({
       [STORAGE_KEY]: JSON.stringify(messages)
@@ -120,19 +349,56 @@ function handleServerMessage(message: any) {
   console.log('[Server] Received message:', message.type, 'id:', message.id);
   if (message.type === 'message') {
     console.log('[Server] Forwarding message to content script');
-    // Forward message to content script
-    chrome.tabs.query({ url: 'https://www.doubao.com/*' }, (tabs) => {
-      console.log('[Server] Found', tabs.length, 'tabs matching URL');
-      tabs.forEach((tab) => {
-        if (tab.id) {
-          console.log('[Server] Sending message to tab', tab.id);
-          chrome.tabs.sendMessage(tab.id, message).catch((error) => {
-            console.error('[Server] Failed to send message to content script:', error);
-          });
-        }
+    // Get available tab from pool
+    tabPoolManager.getAvailableTab().then((tabId) => {
+      // Mark tab as busy
+      tabPoolManager.markTabAsBusy(tabId, message.id);
+      // Store request info
+      activeRequests.set(message.id, {
+        id: message.id,
+        tabId: tabId,
+        startTime: Date.now()
       });
+      
+      // Wait for Content Script to be ready before sending message
+      waitForContentScriptReady(tabId, message).catch((error) => {
+        console.error('[Server] Failed to send message to content script:', error);
+        // Mark tab as idle if send failed
+        tabPoolManager.markTabAsIdle(tabId);
+        activeRequests.delete(message.id);
+      });
+    }).catch((error) => {
+      console.error('[Server] Failed to get available tab:', error);
     });
   }
+}
+
+// Wait for Content Script to be ready and send message
+async function waitForContentScriptReady(tabId: number, message: any, maxWaitTime: number = 15000): Promise<void> {
+  const startTime = Date.now();
+  const checkInterval = 500;
+  
+  while (Date.now() - startTime < maxWaitTime) {
+    try {
+      // Try to send a ping to check if Content Script is ready
+      const response = await chrome.tabs.sendMessage(tabId, { type: 'ping' });
+      if (response && response.pong) {
+        console.log('[Server] Content Script is ready on tab', tabId);
+        // Now send the actual message
+        await chrome.tabs.sendMessage(tabId, message);
+        console.log('[Server] Message sent successfully to tab', tabId);
+        return;
+      }
+    } catch (error) {
+      // Content Script not ready yet, wait and retry
+      console.log('[Server] Content Script not ready yet, waiting...');
+    }
+    
+    // Wait before retrying
+    await new Promise(resolve => setTimeout(resolve, checkInterval));
+  }
+  
+  throw new Error(`Content Script not ready on tab ${tabId} after ${maxWaitTime}ms`);
 }
 
 function sendToServer(message: any) {
@@ -142,6 +408,16 @@ function sendToServer(message: any) {
     // Remove from pending if it was there
     pendingMessages.delete(message.id);
     savePendingMessages();
+    
+    // If this is a done or error message, mark tab as idle
+    if (message.type === 'done' || message.type === 'error') {
+      const requestInfo = activeRequests.get(message.id);
+      if (requestInfo) {
+        tabPoolManager.markTabAsIdle(requestInfo.tabId);
+        activeRequests.delete(message.id);
+        console.log(`[Send] Tab ${requestInfo.tabId} marked as idle after request ${message.id}`);
+      }
+    }
   } else {
     // Store message for later
     console.log('[Send] WebSocket not connected, queuing message:', message.type);
@@ -165,6 +441,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const status = ws && ws.readyState === WebSocket.OPEN ? 'connected' : 'disconnected';
     console.log('[Message] Connection status:', status);
     sendResponse({ status });
+  } else if (message.type === 'get_pool_status') {
+    const poolStatus = tabPoolManager.getPoolStatus();
+    console.log('[Message] Pool status:', poolStatus);
+    sendResponse({ poolStatus });
   } else {
     console.log('[Message] Ignoring message type:', message.type);
   }
@@ -173,6 +453,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // Initialize connection and load pending messages
 loadPendingMessages().then(() => {
   connectWebSocket();
+});
+
+// Initialize tab pool manager
+tabPoolManager.startIdleTabCleanup();
+
+// Handle tab closed event
+chrome.tabs.onRemoved.addListener((tabId) => {
+  tabPoolManager.handleTabClosed(tabId);
+  // Also remove from active requests if this tab was handling a request
+  activeRequests.forEach((requestInfo, requestId) => {
+    if (requestInfo.tabId === tabId) {
+      activeRequests.delete(requestId);
+      console.log(`[TabPool] Removed request ${requestId} due to tab closure`);
+    }
+  });
 });
 
 // Periodic heartbeat check to keep service worker alive
