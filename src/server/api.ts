@@ -141,8 +141,8 @@ export class APIServer {
         return;
       }
 
-      // Check if streaming is requested (default: true)
-      const stream = request.stream !== false;
+      // Check if streaming is requested (default: false)
+      const stream = request.stream === true;
       console.log(`Stream mode: ${stream}`);
 
       console.log('Request validated, checking for available clients');
@@ -259,11 +259,17 @@ export class APIServer {
     // Send initial comment to flush headers immediately
     res.write(': connected\n\n');
 
+    // Combine all message contents with 3 line breaks between them
+    const combinedContent = request.messages
+      .map((msg: any) => msg.content)
+      .filter((content: any) => content)
+      .join('\n\n\n');
+
     // Send message to client
     const message: WebSocketMessage = {
       type: 'message',
       id: requestId,
-      content: request.messages[request.messages.length - 1].content,
+      content: combinedContent,
     };
 
     console.log(`[API] Sending message to client ${clientId}: ${(message.content || '').substring(0, 50)}...`);
@@ -327,21 +333,29 @@ export class APIServer {
           // Return complete response in OpenAI format
           res.json({
             id: requestId,
-            object: 'text_completion',
+            object: 'chat.completion',
             created: Math.floor(Date.now() / 1000),
             model: request.model || 'doubao',
             choices: [
               {
-                text: fullContent,
                 index: 0,
-                logprobs: null,
+                message: {
+                  role: 'assistant',
+                  content: fullContent
+                },
                 finish_reason: 'stop'
               }
             ],
             usage: {
               prompt_tokens: 0,
               completion_tokens: 0,
-              total_tokens: 0
+              total_tokens: 0,
+              prompt_tokens_details: {
+                cached_tokens: 0
+              },
+              completion_tokens_details: {
+                reasoning_tokens: 0
+              }
             }
           });
         }
@@ -349,10 +363,15 @@ export class APIServer {
     });
 
     // Send message to client
+    const combinedContent = request.messages
+      .map((msg: any) => msg.content)
+      .filter((content: any) => content)
+      .join('\n\n\n');
+
     const message: WebSocketMessage = {
       type: 'message',
       id: requestId,
-      content: request.messages[request.messages.length - 1].content,
+      content: combinedContent,
     };
 
     console.log(`[API] Sending message to client ${clientId}: ${(message.content || '').substring(0, 50)}...`);
